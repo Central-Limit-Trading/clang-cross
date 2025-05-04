@@ -1,0 +1,753 @@
+#!/bin/bash
+
+set -e
+
+# Disable color output to avoid ANSI escape sequences interfering with script execution
+# These environment variables affect the output of grep, ls and other commands
+export GREP_OPTIONS=
+export GREP_COLORS=
+unset GREP_OPTIONS
+unset GREP_COLORS
+# Ensure grep does not use color
+alias grep='grep --color=never' 2>/dev/null || true
+# Disable color output for ls
+unalias ls 2>/dev/null || true
+
+# Script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Check if sudo is needed (usually runs as root in Docker containers)
+SUDO_CMD=""
+if [ "$(id -u)" -ne 0 ]; then
+    SUDO_CMD="sudo"
+fi
+
+# Parse arguments
+TARGET=$1
+SKIP_DEPS=false
+
+if [ -z "$TARGET" ]; then
+    echo "Error: Missing target architecture parameter"
+    echo "Usage: $0 <target|llvm> [--skip-deps]"
+    echo "Examples:"
+    echo "  $0 llvm                          # Build LLVM only"
+    echo "  $0 x86_64-unknown-linux-musl     # Build target toolchain"
+    exit 1
+fi
+
+if [ "$2" == "--skip-deps" ]; then
+    SKIP_DEPS=true
+fi
+
+# System detection function
+detect_system() {
+    local system="unknown"
+
+    # Check /etc/os-release first
+    if [ -f /etc/os-release ]; then
+        # shellcheck source=/dev/null
+        source /etc/os-release
+        case "$ID" in
+            # Ubuntu - use version-specific configuration
+            ubuntu)
+                if [ "${VERSION_ID}" = "22.04" ]; then
+                    system="ubuntu22"
+                else
+                    # Other versions fall back to generic debian configuration
+                    system="debian"
+                fi
+                ;;
+            debian|linuxmint)
+                system="debian"
+                ;;
+            # Alibaba Cloud Linux 3 - use dedicated configuration
+            alinux)
+                if [ "${VERSION_ID}" = "3" ]; then
+                    system="alinux3"
+                else
+                    # Other versions fall back to generic rhel configuration
+                    system="rhel"
+                fi
+                ;;
+            # Amazon Linux - use dedicated configuration
+            amzn)
+                if [ "${VERSION_ID}" = "2" ]; then
+                    system="amazonlinux2"
+                elif [ "${VERSION_ID}" = "2023" ]; then
+                    system="amazonlinux2023"
+                else
+                    # Other versions fall back to generic rhel configuration
+                    system="rhel"
+                fi
+                ;;
+            # CentOS - use version-specific configuration
+            centos)
+                if [ "${VERSION_ID}" = "7" ]; then
+                    system="centos7"
+                else
+                    # Other versions fall back to generic rhel configuration
+                    system="rhel"
+                fi
+                ;;
+            # Other RHEL-based distributions use generic configuration
+            rhel|fedora|rocky|almalinux)
+                system="rhel"
+                ;;
+            arch|manjaro)
+                system="arch"
+                ;;
+            alpine)
+                system="alpine"
+                ;;
+            *)
+                # Check ID_LIKE
+                if [ -n "${ID_LIKE:-}" ]; then
+                    case "$ID_LIKE" in
+                        *rhel*|*fedora*|*centos*)
+                            system="rhel"
+                            ;;
+                        *debian*|*ubuntu*)
+                            system="debian"
+                            ;;
+                        *arch*)
+                            system="arch"
+                            ;;
+                    esac
+                fi
+                ;;
+        esac
+    # Fall back to detecting package manager
+    elif command -v apt-get &> /dev/null; then
+        system="debian"
+    elif command -v dnf &> /dev/null || command -v yum &> /dev/null; then
+        system="rhel"
+    elif command -v pacman &> /dev/null; then
+        system="arch"
+    elif command -v apk &> /dev/null; then
+        system="alpine"
+    fi
+
+    echo "$system"
+}
+
+# Dependency installation function
+install_dependencies() {
+    local system
+    system=$(detect_system)
+
+    if [ "$system" == "unknown" ]; then
+        echo "Error: Unable to detect operating system type"
+        echo "Please manually install dependencies or use --skip-deps parameter to skip dependency installation"
+        exit 1
+    fi
+
+    local config_file="${SCRIPT_DIR}/packages/${system}.conf"
+
+    if [ ! -f "$config_file" ]; then
+        echo "Error: Unsupported system '$system'"
+        echo "Configuration file not found: $config_file"
+        echo "Supported systems: debian, ubuntu22, rhel, amazonlinux2, alinux3, centos7, arch, alpine"
+        echo "Hint: If you are using a RHEL-based distribution, the generic rhel configuration may be used"
+        exit 1
+    fi
+
+    echo "=========================================="
+    echo "Detected operating system: $system"
+    echo "Configuration file: $config_file"
+    echo "=========================================="
+
+    # Load configuration file
+    # shellcheck source=/dev/null
+    source "$config_file"
+
+    # Execute mirror setup commands (if defined)
+    if [ ${#MIRROR_SETUP_COMMANDS[@]} -gt 0 ]; then
+        echo "Configuring package mirrors..."
+        for cmd in "${MIRROR_SETUP_COMMANDS[@]}"; do
+            eval "$cmd"
+        done
+    fi
+
+    # Update package manager
+    echo "Updating package manager..."
+    eval "$PKG_UPDATE_CMD"
+
+    # Install packages
+    echo "Installing dependencies (${#PACKAGES[@]} packages)..."
+    eval "$PKG_INSTALL_CMD ${PACKAGES[*]}"
+
+    # Execute additional setup commands
+    if [ ${#EXTRA_SETUP_COMMANDS[@]} -gt 0 ]; then
+        echo "Executing system-specific configuration..."
+        for cmd in "${EXTRA_SETUP_COMMANDS[@]}"; do
+            eval "$cmd"
+        done
+    fi
+
+    echo "=========================================="
+    echo "Dependency installation completed"
+    echo "=========================================="
+}
+
+# Install dependencies
+if [ "$SKIP_DEPS" == false ]; then
+    install_dependencies
+else
+    echo "Skipping dependency installation (--skip-deps)"
+fi
+
+# Constants
+# GitHub organization and immutable source/artifact versions.
+GITHUB_ORG="Central-Limit-Trading"
+CT_URL="https://github.com/${GITHUB_ORG}"
+LLVM_VERSION="22.1.8"
+LLVM_SOURCE_REVISION="ca7933e47d3a3451d81e72ac174dcb5aa28b59d1"
+LLVM_ARCHIVE="clang-cross-${LLVM_VERSION}.tar.xz"
+GNU_CROSS_VERSION="v0.0.1"
+MUSL_CROSS_VERSION="v1.2.6-r1"
+LLVM_TARGETS="AArch64;ARM;LoongArch;Mips;PowerPC;RISCV;SystemZ;X86"
+
+verify_llvm_source() {
+	local actual_revision
+	actual_revision=$(
+		cd "${PROJECT_ROOT}/llvm"
+		git -c "safe.directory=${PROJECT_ROOT}/llvm" rev-parse HEAD
+	)
+	if [ "${actual_revision}" != "${LLVM_SOURCE_REVISION}" ]; then
+		echo "Error: llvm source is ${actual_revision}, expected ${LLVM_SOURCE_REVISION}" >&2
+		return 1
+	fi
+}
+
+verify_file_checksum() {
+	local file=$1
+	local sidecar="${file}.sha256"
+	local expected_hash
+	local actual_hash
+
+	if [ ! -f "${file}" ] || [ ! -f "${sidecar}" ]; then
+		echo "Error: artifact or checksum sidecar missing: ${file}" >&2
+		return 1
+	fi
+	expected_hash=$(awk 'NF {print $1; exit}' "${sidecar}")
+	actual_hash=$(sha256sum "${file}" | awk '{print $1}')
+	if [ "${actual_hash,,}" != "${expected_hash,,}" ]; then
+		echo "Error: checksum mismatch for ${file}" >&2
+		return 1
+	fi
+	echo "Checksum verification passed: ${file}"
+}
+
+verify_clang_version() {
+	local compiler=$1
+	local version_output
+
+	version_output=$("${compiler}" --version)
+	if ! grep -Fq "clang version ${LLVM_VERSION}" <<<"${version_output}"; then
+		echo "Error: installed Clang is not ${LLVM_VERSION}:" >&2
+		echo "${version_output}" >&2
+		return 1
+	fi
+}
+
+verify_base_toolchain() {
+	local target=$1
+	local toolchain_dir=$2
+	local compiler="${toolchain_dir}/bin/${target}-gcc"
+	local loader="${toolchain_dir}/${target}/sysroot/lib/${EXPECTED_MUSL_LOADER:-}"
+	local actual_gcc
+	local loader_output
+
+	[ -n "${EXPECTED_BASE_GCC_VERSION:-}${EXPECTED_MUSL_VERSION:-}${EXPECTED_MUSL_LOADER:-}" ] || return 0
+	if [ -z "${EXPECTED_BASE_GCC_VERSION:-}" ] || [ -z "${EXPECTED_MUSL_VERSION:-}" ] || \
+	   [ -z "${EXPECTED_MUSL_LOADER:-}" ]; then
+		echo "Error: incomplete base-toolchain version metadata for ${target}" >&2
+		return 1
+	fi
+	if [ ! -x "${compiler}" ]; then
+		echo "Error: base compiler not found: ${compiler}" >&2
+		return 1
+	fi
+	actual_gcc=$("${compiler}" -dumpfullversion)
+	if [ "${actual_gcc}" != "${EXPECTED_BASE_GCC_VERSION}" ]; then
+		echo "Error: base GCC is ${actual_gcc}, expected ${EXPECTED_BASE_GCC_VERSION}" >&2
+		return 1
+	fi
+	if [ ! -x "${loader}" ]; then
+		echo "Error: musl loader not found: ${loader}" >&2
+		return 1
+	fi
+	loader_output=$("${loader}" 2>&1 || true)
+	if ! grep -Fq "Version ${EXPECTED_MUSL_VERSION}" <<<"${loader_output}"; then
+		echo "Error: musl loader is not ${EXPECTED_MUSL_VERSION}:" >&2
+		echo "${loader_output}" >&2
+		return 1
+	fi
+	echo "Validated base toolchain: GCC ${actual_gcc}, musl ${EXPECTED_MUSL_VERSION}"
+}
+
+# Function: Build LLVM
+build_llvm() {
+	echo "=========================================="
+	verify_llvm_source
+	echo "Building LLVM/Clang..."
+	echo "=========================================="
+
+	# Create build directory
+	${SUDO_CMD} mkdir -p /opt
+	${SUDO_CMD} chmod 0777 /opt
+
+	# Clean old build directory to avoid CMake cache issues
+	rm -rf build-llvm
+	mkdir -p build-llvm
+
+	pushd build-llvm
+
+	# Configure LLVM
+	cmake -G Ninja -S ../llvm/llvm \
+		-DLLVM_ENABLE_PROJECTS="clang;lld;openmp" \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_INSTALL_PREFIX=/opt/clang-cross \
+		-DCLANG_DEFAULT_LINKER=lld \
+		-DCLANG_DEFAULT_PIE_ON_LINUX=ON \
+		-DCLANG_LINK_CLANG_DYLIB=ON \
+		-DENABLE_LINKER_BUILD_ID=ON \
+		-DLLVM_ENABLE_RTTI=ON \
+		-DLLVM_ENABLE_ZLIB=ON \
+		-DLLVM_LINK_LLVM_DYLIB=ON \
+		-DLLVM_TARGETS_TO_BUILD="${LLVM_TARGETS}" \
+		-DLLVM_INSTALL_TOOLCHAIN_ONLY=ON \
+		-DLLVM_TOOLCHAIN_TOOLS="llvm-ar;llvm-cov;llvm-cxxfilt;llvm-dlltool;llvm-dwp;llvm-lib;llvm-mca;llvm-ml;llvm-ml64;llvm-nm;llvm-objcopy;llvm-objdump;llvm-pdbutil;llvm-profdata;llvm-profgen;llvm-ranlib;llvm-rc;llvm-readobj;llvm-size;llvm-strings;llvm-strip;llvm-symbolizer;llvm-xray;addr2line;ar;c++filt;nm;objcopy;objdump;ranlib;readelf;size;strings;strip" \
+		-DLLVM_INCLUDE_TESTS=OFF \
+		-DLIBOMP_USE_QUAD_PRECISION=OFF
+
+	# Build and install
+	ninja install
+
+	# Strip binaries to reduce size
+	find /opt/clang-cross/bin -type f -executable -exec strip --strip-unneeded {} \; 2>/dev/null || true
+	verify_clang_version /opt/clang-cross/bin/clang
+
+	popd
+	rm -rf build-llvm
+
+	# Package LLVM
+	# Remove old clang-cross directory if it exists
+	rm -rf clang-cross
+	${SUDO_CMD} mv /opt/clang-cross .
+	${SUDO_CMD} chown -R root:root clang-cross
+	${SUDO_CMD} tar -cJvf "${LLVM_ARCHIVE}" clang-cross
+	${SUDO_CMD} sha256sum "${LLVM_ARCHIVE}" | awk '{ print $1 }' > "${LLVM_ARCHIVE}.sha256"
+	verify_file_checksum "${LLVM_ARCHIVE}"
+
+	echo "=========================================="
+	echo "LLVM build completed: ${LLVM_ARCHIVE}"
+	echo "=========================================="
+}
+
+# Function: Download toolchain
+download_toolchain() {
+	local url="$1"
+	local target="$2"
+
+	echo "=========================================="
+	echo "Downloading toolchain for: ${target}"
+	echo "URL: ${url}"
+	echo "=========================================="
+
+	"${PROJECT_ROOT}/scripts/download-toolchain.sh" "${url}" "${PROJECT_ROOT}"
+}
+
+# Function: map a runtime manifest token to the compiler-rt filename.
+compiler_rt_runtime_file() {
+	local name=$1
+	local arch=$2
+
+	case "${name}" in
+		builtins) echo "libclang_rt.builtins-${arch}.a" ;;
+		asan) echo "libclang_rt.asan-${arch}.a" ;;
+		asan_cxx) echo "libclang_rt.asan_cxx-${arch}.a" ;;
+		asan_static) echo "libclang_rt.asan_static-${arch}.a" ;;
+		asan_preinit) echo "libclang_rt.asan-preinit-${arch}.a" ;;
+		lsan) echo "libclang_rt.lsan-${arch}.a" ;;
+		ubsan_minimal) echo "libclang_rt.ubsan_minimal-${arch}.a" ;;
+		ubsan_standalone) echo "libclang_rt.ubsan_standalone-${arch}.a" ;;
+		ubsan_standalone_cxx) echo "libclang_rt.ubsan_standalone_cxx-${arch}.a" ;;
+		tsan) echo "libclang_rt.tsan-${arch}.a" ;;
+		tsan_cxx) echo "libclang_rt.tsan_cxx-${arch}.a" ;;
+		msan) echo "libclang_rt.msan-${arch}.a" ;;
+		msan_cxx) echo "libclang_rt.msan_cxx-${arch}.a" ;;
+		dfsan) echo "libclang_rt.dfsan-${arch}.a" ;;
+		profile) echo "libclang_rt.profile-${arch}.a" ;;
+		fuzzer) echo "libclang_rt.fuzzer-${arch}.a" ;;
+		fuzzer_no_main) echo "libclang_rt.fuzzer_no_main-${arch}.a" ;;
+		fuzzer_interceptors) echo "libclang_rt.fuzzer_interceptors-${arch}.a" ;;
+		memprof) echo "libclang_rt.memprof-${arch}.a" ;;
+		memprof_cxx) echo "libclang_rt.memprof_cxx-${arch}.a" ;;
+		gwp_asan) echo "libclang_rt.gwp_asan-${arch}.a" ;;
+		xray) echo "libclang_rt.xray-${arch}.a" ;;
+		xray_basic) echo "libclang_rt.xray-basic-${arch}.a" ;;
+		xray_fdr) echo "libclang_rt.xray-fdr-${arch}.a" ;;
+		xray_profiling) echo "libclang_rt.xray-profiling-${arch}.a" ;;
+		*)
+			echo "Error: unknown CRT_REQUIRED_RUNTIMES token: ${name}" >&2
+			return 1
+			;;
+	esac
+}
+
+# Function: validate that the expected compiler-rt runtime artifacts were
+# installed into clang's resource directory.
+validate_compiler_rt_runtime_files() {
+	local target=$1
+	local resdir=$2
+	local arch=${CRT_RUNTIME_ARCH:-${target%%-*}}
+	local libdir=""
+	local -a missing=()
+	local item
+	local file
+
+	[ -n "${CRT_REQUIRED_RUNTIMES:-}" ] || return 0
+
+	if [ -d "${resdir}/lib/${target}" ]; then
+		libdir="${resdir}/lib/${target}"
+	elif [ -d "${resdir}/lib/linux" ]; then
+		libdir="${resdir}/lib/linux"
+	else
+		echo "Error: compiler-rt lib directory not found under ${resdir}/lib" >&2
+		return 1
+	fi
+
+	for item in ${CRT_REQUIRED_RUNTIMES}; do
+		file=$(compiler_rt_runtime_file "${item}" "${arch}") || return 1
+		if [ ! -e "${libdir}/${file}" ]; then
+			missing+=("${libdir}/${file}")
+		fi
+	done
+
+	if [ ${#missing[@]} -ne 0 ]; then
+		echo "Error: missing compiler-rt runtime files for ${target}:" >&2
+		printf '  - %s\n' "${missing[@]}" >&2
+		return 1
+	fi
+
+	echo "Validated compiler-rt runtime files for ${target} in ${libdir}"
+}
+
+# Function: Build LLVM runtimes (compiler-rt sanitizers/profile/builtins and,
+# when requested by target config, libc++/libc++abi/libunwind) for the target,
+# using the freshly installed cross clang and target sysroot. Driven by CRT_*
+# variables sourced from targets/<TARGET>/config.
+build_compiler_rt() {
+	TARGET=${1}
+
+	local CC="/opt/clang-cross/bin/clang"
+	local CXX="/opt/clang-cross/bin/clang++"
+	local SYSROOT="/opt/clang-cross/${TARGET}/sysroot"
+	local PATCHDIR="${PROJECT_ROOT}/targets/${TARGET}/patches"
+	local BUILDDIR="${PROJECT_ROOT}/build-crt"
+	local RUNTIMES="${CRT_ENABLE_RUNTIMES:-compiler-rt}"
+	local RESDIR
+	RESDIR="$(${CC} --target="${TARGET}" -print-resource-dir)"
+	local -a APPLIED=()
+	local -a CRT_FLAGS=()
+	local IN_BUILDDIR=0
+	local p
+
+	cleanup_compiler_rt_build() {
+		local rc=$?
+		local cleanup_rc=${rc}
+
+		trap - RETURN
+
+		# The RETURN trap is shell-global once set; bash also re-fires it on
+		# the return of outer functions / the script end. On those spurious
+		# re-fires build_compiler_rt's locals are out of scope (empty), so
+		# only act while our own locals are still live.
+		if [ -z "${BUILDDIR:-}" ]; then
+			return "${rc}"
+		fi
+
+		if [ "${IN_BUILDDIR:-0}" -eq 1 ]; then
+			popd >/dev/null || true
+			IN_BUILDDIR=0
+		fi
+
+		rm -rf "${BUILDDIR}"
+
+		for p in "${APPLIED[@]}"; do
+			echo "Reverting patch: $(basename "$p")"
+			if ! patch -d "${PROJECT_ROOT}/llvm" -p1 -R --dry-run --fuzz=2 --batch < "$p" >/dev/null; then
+				echo "Error: cannot cleanly revert patch: $(basename "$p")" >&2
+				cleanup_rc=1
+				continue
+			fi
+			if ! patch -d "${PROJECT_ROOT}/llvm" -p1 -R --fuzz=2 --batch < "$p"; then
+				cleanup_rc=1
+			fi
+		done
+
+		return "${cleanup_rc}"
+	}
+	trap cleanup_compiler_rt_build RETURN
+
+	echo "=========================================="
+	echo "Building LLVM runtimes for: ${TARGET}"
+	echo "Runtimes: ${RUNTIMES}"
+	echo "Resource dir: ${RESDIR}"
+	echo "=========================================="
+
+	if [ ! -d "${PROJECT_ROOT}/llvm/runtimes" ] || [ ! -d "${PROJECT_ROOT}/llvm/compiler-rt" ]; then
+		echo "Error: llvm submodule source tree is not initialized under ${PROJECT_ROOT}/llvm" >&2
+		echo "Hint: run 'git submodule update --init llvm' before building target runtimes." >&2
+		return 1
+	fi
+
+	# Apply target-specific compiler-rt patches (e.g. Alpine musl fixes).
+	# Applied with GNU patch's default fuzz (= 2), mirroring Alpine's
+	# `patch -p1`; reverted on every return path (see RETURN trap) so the
+	# shared llvm/ source tree stays clean. The forward dry-run is the gate:
+	# a clean tree applies; a dirty/already-patched tree fails it. (Do NOT
+	# use `patch -R` rc to detect "already applied": on a clean tree GNU
+	# patch prints "Unreversed patch detected! Ignoring -R" and forward-
+	# applies, so -R --dry-run returns 0 and false-positives.)
+	if [ -d "${PATCHDIR}" ]; then
+		for p in "${PATCHDIR}"/*.patch; do
+			[ -e "$p" ] || continue
+			if ! patch -d "${PROJECT_ROOT}/llvm" -p1 --dry-run --fuzz=2 --batch < "$p" >/dev/null 2>&1; then
+				echo "Error: patch does not apply cleanly (already applied or dirty llvm tree?): $(basename "$p")" >&2
+				echo "Ensure the llvm source tree is clean before running the target build." >&2
+				return 1
+			fi
+			echo "Applying patch: $(basename "$p")"
+			patch -d "${PROJECT_ROOT}/llvm" -p1 --fuzz=2 --batch < "$p"
+			APPLIED=("$p" "${APPLIED[@]}")
+		done
+	fi
+
+	# musl: compiler-rt must be built without .preinit_array (Alpine).
+	if [ -n "${CRT_MUSL_PREINIT_OFF:-}" ]; then
+		CRT_FLAGS+=(
+			-DCMAKE_C_FLAGS="-DNDEBUG -DSANITIZER_CAN_USE_PREINIT_ARRAY=0"
+			-DCMAKE_CXX_FLAGS="-DNDEBUG -DSANITIZER_CAN_USE_PREINIT_ARRAY=0"
+		)
+	fi
+	if [ -n "${CRT_SANITIZERS_TO_BUILD:-}" ]; then
+		CRT_FLAGS+=(-DCOMPILER_RT_SANITIZERS_TO_BUILD="${CRT_SANITIZERS_TO_BUILD}")
+	fi
+	if [ -n "${CRT_LIBCXX_HAS_MUSL_LIBC:-}" ]; then
+		CRT_FLAGS+=(-DLIBCXX_HAS_MUSL_LIBC="${CRT_LIBCXX_HAS_MUSL_LIBC}")
+	fi
+	if [ -n "${CRT_LIBUNWIND_HAS_NODEFAULTLIBS_FLAG:-}" ]; then
+		CRT_FLAGS+=(-DLIBUNWIND_HAS_NODEFAULTLIBS_FLAG="${CRT_LIBUNWIND_HAS_NODEFAULTLIBS_FLAG}")
+	fi
+	if [[ "${RUNTIMES}" == *libunwind* ]]; then
+		CRT_FLAGS+=(-DLIBUNWIND_SYSROOT="${SYSROOT}")
+	fi
+
+	rm -rf "${BUILDDIR}"
+	mkdir -p "${BUILDDIR}"
+	pushd "${BUILDDIR}"
+	IN_BUILDDIR=1
+
+	# Standalone runtimes build: the runtimes/ entry point sets
+	# LLVM_RUNTIMES_BUILD=ON so compiler-rt does NOT need an installed
+	# llvm-config (which build_llvm strips via LLVM_INSTALL_TOOLCHAIN_ONLY).
+	cmake -G Ninja -S "${PROJECT_ROOT}/llvm/runtimes" \
+		-DLLVM_ENABLE_RUNTIMES="${RUNTIMES}" \
+		-DCMAKE_BUILD_TYPE="${CRT_CMAKE_BUILD_TYPE:-Release}" \
+		-DCMAKE_C_COMPILER="${CC}" \
+		-DCMAKE_CXX_COMPILER="${CXX}" \
+		-DCMAKE_C_COMPILER_TARGET="${TARGET}" \
+		-DCMAKE_CXX_COMPILER_TARGET="${TARGET}" \
+		-DCMAKE_ASM_COMPILER_TARGET="${TARGET}" \
+		-DCMAKE_SYSTEM_NAME=Linux \
+		-DCMAKE_SYSROOT="${SYSROOT}" \
+		-DCMAKE_INSTALL_PREFIX="${SYSROOT}/usr" \
+		-DLLVM_DEFAULT_TARGET_TRIPLE="${TARGET}" \
+		-DCOMPILER_RT_DEFAULT_TARGET_ONLY=ON \
+		-DCOMPILER_RT_INSTALL_PATH="${RESDIR}" \
+		-DCOMPILER_RT_CAN_EXECUTE_TESTS=OFF \
+		-DCOMPILER_RT_INCLUDE_TESTS=OFF \
+		-DCOMPILER_RT_BUILD_BUILTINS="${CRT_BUILD_BUILTINS:-ON}" \
+		-DCOMPILER_RT_BUILD_SANITIZERS="${CRT_BUILD_SANITIZERS:-ON}" \
+		-DCOMPILER_RT_BUILD_PROFILE="${CRT_BUILD_PROFILE:-ON}" \
+		-DCOMPILER_RT_BUILD_MEMPROF="${CRT_BUILD_MEMPROF:-ON}" \
+		-DCOMPILER_RT_BUILD_XRAY="${CRT_BUILD_XRAY:-OFF}" \
+		-DCOMPILER_RT_BUILD_LIBFUZZER="${CRT_BUILD_LIBFUZZER:-ON}" \
+		-DCOMPILER_RT_BUILD_GWP_ASAN="${CRT_BUILD_GWP_ASAN:-ON}" \
+		-DCOMPILER_RT_BUILD_ORC=OFF \
+		"${CRT_FLAGS[@]}"
+
+	ninja install
+
+	popd
+	IN_BUILDDIR=0
+
+	# Directory compat: make both <resource>/lib/linux and
+	# <resource>/lib/<triple> resolve, regardless of which layout
+	# compiler-rt produced (per-target dir vs classic "linux").
+	if [ -d "${RESDIR}/lib/linux" ] && [ ! -e "${RESDIR}/lib/${TARGET}" ]; then
+		ln -s linux "${RESDIR}/lib/${TARGET}"
+	elif [ -d "${RESDIR}/lib/${TARGET}" ] && [ ! -e "${RESDIR}/lib/linux" ]; then
+		ln -s "${TARGET}" "${RESDIR}/lib/linux"
+	fi
+
+	validate_compiler_rt_runtime_files "${TARGET}" "${RESDIR}"
+}
+
+# Function: Build target toolchain
+build_target() {
+	TARGET=${1}
+
+	echo "=========================================="
+	echo "Building target toolchain: ${TARGET}"
+	echo "=========================================="
+
+	# Load target configuration
+	if [ ! -f "targets/${TARGET}/config" ]; then
+		echo "Error: Target configuration not found: targets/${TARGET}/config"
+		exit 1
+	fi
+	. targets/${TARGET}/config
+
+	# Extract the versioned, locally verified LLVM cache.
+	verify_file_checksum "${LLVM_ARCHIVE}"
+	${SUDO_CMD} tar -xf "${LLVM_ARCHIVE}" -C /opt
+	${SUDO_CMD} chown -R $(id -u):$(id -g) /opt/clang-cross
+	verify_clang_version /opt/clang-cross/bin/clang
+
+	# Detect system for system-specific toolchain download
+	SYSTEM=$(detect_system)
+	echo "Detected system: ${SYSTEM}"
+
+	# Define systems that have precompiled system-specific toolchains
+	SUPPORTED_SYSTEMS="ubuntu22 centos7 alinux3 amazonlinux2"
+
+	# Determine repository based on target type
+	case ${TARGET} in
+		*gnu*)
+			REPO="gnu-cross"
+			BASE_TOOLCHAIN_VERSION="${GNU_CROSS_VERSION}"
+			;;
+		*musl*)
+			REPO="musl-cross"
+			BASE_TOOLCHAIN_VERSION="${MUSL_CROSS_VERSION}"
+			;;
+		*)
+			echo "Error: Unknown target type: ${TARGET}"
+			exit 1
+			;;
+	esac
+
+	# Generate download URL
+	if [[ " ${SUPPORTED_SYSTEMS} " =~ " ${SYSTEM} " ]]; then
+		# System-specific toolchain is available
+		DOWNLOAD_URL="${CT_URL}/${REPO}/releases/download/${BASE_TOOLCHAIN_VERSION}/${TARGET}-${SYSTEM}.tar.xz"
+		echo "Using system-specific toolchain for: ${SYSTEM}"
+	else
+		# Use generic toolchain for unsupported systems
+		DOWNLOAD_URL="${CT_URL}/${REPO}/releases/download/${BASE_TOOLCHAIN_VERSION}/${TARGET}.tar.xz"
+		echo "Using generic toolchain for system: ${SYSTEM}"
+	fi
+
+	# Download prebuilt toolchain
+	rm -rf "${TARGET}"
+	if ! download_toolchain "${DOWNLOAD_URL}" "${TARGET}"; then
+		exit 1
+	fi
+
+	if [ ! -d "${TARGET}" ]; then
+		echo "Error: Toolchain directory not found after download: ${TARGET}"
+		exit 1
+	fi
+	verify_base_toolchain "${TARGET}" "${PROJECT_ROOT}/${TARGET}"
+
+	# Extract necessary files
+	find ${TARGET} -exec chmod +w {} \;
+	cp -a ${TARGET}/include /opt/clang-cross/
+	cp -a ${TARGET}/lib/gcc /opt/clang-cross/lib/
+	cp -a ${TARGET}/${TARGET} /opt/clang-cross/
+
+	# Clean up unnecessary files
+	rm -rf /opt/clang-cross/lib/gcc/${TARGET}/*/{install-tools,plugin}
+	rm -rf /opt/clang-cross/${TARGET}/{bin,debug-root,lib}
+
+	# Build compiler-rt runtimes (sanitizers / profile / builtins) for the
+	# target. Runs after the sysroot is in place and before the tree is
+	# made read-only at the end of build_target.
+	build_compiler_rt "${TARGET}"
+
+	# Create compiler wrapper scripts
+	for n in clang:clang clang++:clang++ cpp:clang-cpp; do
+		cat > /opt/clang-cross/bin/${TARGET}-${n%%:*} <<-EOF
+			#!/bin/sh
+
+			TARGET=${TARGET}
+			BINDIR=\$(dirname "\$0")
+
+			exec "\${BINDIR}/${n##*:}" --target=\${TARGET} --sysroot=\${BINDIR}/../\${TARGET}/sysroot ${CLANG_ARGS} "\$@"
+		EOF
+		chmod +x /opt/clang-cross/bin/${TARGET}-${n%%:*}
+	done
+
+	# Create symbolic links
+	ln -sf ${TARGET}-clang /opt/clang-cross/bin/${TARGET}-cc
+	ln -sf ${TARGET}-clang++ /opt/clang-cross/bin/${TARGET}-c++
+
+	# Create LLVM tool wrapper scripts
+	for n in ar:ar c++filt:cxxfilt nm:nm objcopy:objcopy objdump:objdump ranlib:ranlib size:size strings:strings strip:strip; do
+		cat > /opt/clang-cross/bin/${TARGET}-${n%%:*} <<-EOF
+			#!/bin/sh
+
+			BINDIR=\$(dirname "\$0")
+
+			exec "\${BINDIR}/llvm-${n##*:}" "\$@"
+		EOF
+		chmod +x /opt/clang-cross/bin/${TARGET}-${n%%:*}
+	done
+
+	if [ -n "${EXPECTED_MUSL_VERSION:-}" ]; then
+		"${PROJECT_ROOT}/scripts/verify-toolchain.sh" "${TARGET}" \
+			/opt/clang-cross "${LLVM_VERSION}" \
+			"${EXPECTED_MUSL_VERSION}" "${EXPECTED_MUSL_LOADER}"
+	fi
+
+	# Set read-only permissions
+	find /opt/clang-cross -exec chmod -w {} \;
+
+	# Clean up temporary files
+	rm -rf ${TARGET}
+
+	# Package
+	${SUDO_CMD} mv /opt/clang-cross ${TARGET}
+	${SUDO_CMD} chown -R root:root ${TARGET}
+	${SUDO_CMD} tar -cJvf ${TARGET}.tar.xz ${TARGET}
+	${SUDO_CMD} sha256sum ${TARGET}.tar.xz | awk '{ print $1 }' > ${TARGET}.tar.xz.sha256
+	verify_file_checksum "${TARGET}.tar.xz"
+
+	echo "=========================================="
+	echo "Target toolchain build completed!"
+	echo "=========================================="
+	echo "Output files:"
+	echo "  - ${TARGET}.tar.xz"
+	echo "  - ${TARGET}.tar.xz.sha256"
+	echo ""
+	echo "SHA256: $(cat ${TARGET}.tar.xz.sha256)"
+	echo "=========================================="
+}
+
+# Main build logic
+verify_llvm_source
+if [ ! -e "${LLVM_ARCHIVE}" ]; then
+	build_llvm
+else
+	verify_file_checksum "${LLVM_ARCHIVE}"
+fi
+
+if [ "${TARGET}" != "llvm" ]; then
+	build_target ${TARGET}
+fi
+
+# vim: set ts=4 sw=4 noexpandtab:
